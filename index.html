@@ -109,7 +109,8 @@
         <li><b>APIs &amp; Services → Library</b> থেকে <b>Google Drive API</b> চালু (Enable) করুন।</li>
         <li><b>OAuth consent screen</b>: External বাছুন, অ্যাপের নাম দিন, আর <b>Test users</b>-এ নিজের Gmail যোগ করুন।</li>
         <li><b>Credentials → Create credentials → OAuth client ID</b> → টাইপ <b>Web application</b>।</li>
-        <li><b>Authorized JavaScript origins</b>-এ এই অ্যাপের ঠিকানা দিন: <code id="originHint"></code></li>
+        <li><b>Authorized JavaScript origins</b>-এ দিন: <code id="originHint"></code></li>
+        <li><b>Authorized redirect URIs</b>-এ দিন: <code id="redirectHint"></code></li>
         <li>যে Client ID পাবেন, সেটা কপি করে উপরে পেস্ট করুন।</li>
       </ol>
     </details>
@@ -349,8 +350,7 @@ function requestToken(prompt){
     if (!state.tokenClient && !initTokenClient()) return reject(new Error('Google সাইন-ইন লোড হয়নি। Client ID ঠিক আছে কিনা দেখুন।'));
     state.tokenClient.callback = resp => {
       if (resp.error) return reject(new Error(resp.error_description || resp.error));
-      state.token = resp.access_token;
-      state.tokenExp = Date.now() + (Number(resp.expires_in || 3600) - 60) * 1000;
+      setToken(resp.access_token, resp.expires_in);
       resolve(state.token);
     };
     state.tokenClient.error_callback = e => reject(new Error(e?.message || e?.type || 'সাইন-ইন বাতিল হয়েছে'));
@@ -377,8 +377,53 @@ async function getToken(){
     await renewWaiter;
     return state.token;
   }
-  await requestToken('');
-  return state.token;
+  // Not transferring: go through the full-page redirect (works in installed app).
+  startRedirectAuth({silent: true});
+  await new Promise(() => {});   // page is navigating away
+}
+
+/* ---------- redirect sign-in (reliable in installed/home-screen mode) ---------- */
+function redirectUri(){ return location.origin + location.pathname.replace(/index\.html$/, ''); }
+
+function setToken(tok, expiresIn){
+  state.token = tok;
+  state.tokenExp = Date.now() + (Number(expiresIn || 3600) - 60) * 1000;
+  store.set('tok', {t: state.token, e: state.tokenExp});
+}
+
+function startRedirectAuth({silent = false, resume = false} = {}){
+  if (!clientId()){ $('setupCard').classList.remove('hidden'); return; }
+  const nonce = Math.random().toString(36).slice(2) + Date.now().toString(36);
+  store.set('authState', {nonce, silent, resume});
+  store.set('pendingLink', $('srcLink').value.trim());
+  const p = new URLSearchParams({
+    client_id: clientId(), redirect_uri: redirectUri(), response_type: 'token',
+    scope: SCOPE, include_granted_scopes: 'true', state: nonce
+  });
+  const hint = store.get('email', '');
+  if (hint) p.set('login_hint', hint);
+  if (silent && hint) p.set('prompt', 'none');
+  else if (!hint) p.set('prompt', 'consent select_account');
+  location.assign('https://accounts.google.com/o/oauth2/v2/auth?' + p.toString());
+}
+
+// Runs at page load: picks up the token Google sends back in the URL #fragment.
+function handleRedirectReturn(){
+  if (!location.hash || !/(access_token|error)=/.test(location.hash)) return null;
+  const h = new URLSearchParams(location.hash.slice(1));
+  history.replaceState(null, '', location.pathname + location.search);
+  const saved = store.get('authState', null);
+  store.set('authState', null);
+  if (!saved || h.get('state') !== saved.nonce) return {error: 'state_mismatch'};
+  if (h.get('error')){
+    // Silent refresh needs a tap (e.g. consent again) → retry once with the full screen.
+    if (saved.silent && /interaction_required|login_required|consent_required/.test(h.get('error'))){
+      startRedirectAuth({silent: false, resume: saved.resume}); return {redirecting: true};
+    }
+    return {error: h.get('error')};
+  }
+  setToken(h.get('access_token'), h.get('expires_in'));
+  return {ok: true, resume: saved.resume};
 }
 
 async function gfetch(url, opts = {}, {rk = null, retries = 4} = {}){
@@ -417,17 +462,16 @@ async function apiJSON(url, opts, extra){
   return res.status === 204 ? null : res.json();
 }
 
-async function signIn(){
-  try {
-    await requestToken(state.email ? '' : 'consent');
-    const about = await apiJSON(`${API}/about?fields=user(emailAddress,displayName)`);
-    state.email = about.user.emailAddress;
-    store.set('signedIn', true);
-    renderAuth();
-    if ($('srcLink').value) inspectSource();
-  } catch (e){
-    alert('সাইন ইন হয়নি: ' + e.message);
-  }
+function signIn(){
+  // "বদলান" (switch account) → forget the hint so Google shows the account chooser
+  if (state.email){ store.set('email', ''); }
+  startRedirectAuth({silent: false});
+}
+async function loadProfile(){
+  const about = await apiJSON(`${API}/about?fields=user(emailAddress,displayName)`);
+  state.email = about.user.emailAddress;
+  store.set('email', state.email);
+  renderAuth();
 }
 function renderAuth(){
   const ok = !!state.email;
@@ -691,7 +735,12 @@ document.addEventListener('visibilitychange', () => { if (state.running && docum
 async function proceed(){
   const src = state.src, dest = state.dest;
   if (!src || !dest) return;
-  const mode = document.querySelector('input[name=mode]:checked').value;
+  // Make sure the Google session has most of its hour left before a long transfer.
+  if (state.tokenExp - Date.now() < 50 * 60 * 1000){
+    startRedirectAuth({silent: true, resume: true});
+    return;
+  }
+  const mode =document.querySelector('input[name=mode]:checked').value;
 
   // Confirmation step (nothing happens without your OK)
   const where = `"${dest.name}" ফোল্ডারে`;
@@ -699,9 +748,6 @@ async function proceed(){
   let msg = `${what} ${where} ${mode === 'copy' ? 'সরাসরি কপি' : 'ডাউনলোড + আপলোড'} করা হবে।`;
   if (mode === 'stream' && netType() === 'cellular') msg += `\n\n⚠️ আপনি মোবাইল ডাটায় আছেন। প্রায় ${fmtBytes(src.totalBytes * 2)} ডাটা খরচ হবে (ডাউনলোড + আপলোড)।`;
   if (!await ask(msg + '\n\nশুরু করবেন?', {yes:'শুরু করুন', no:'না'})) return;
-
-  // fresh token on this tap → full hour before any renewal is needed
-  try { await requestToken(''); } catch (e){ alert('সাইন-ইন সমস্যা: ' + e.message); return; }
 
   state.running = true; state.abort = new AbortController();
   $('progressCard').classList.remove('hidden'); $('doneBox').classList.add('hidden');
@@ -777,6 +823,7 @@ function updateProceed(){
 
 /* ---------- wire up UI ---------- */
 $('originHint').textContent = location.origin;
+$('redirectHint').textContent = redirectUri();
 $('btnSaveClient').onclick = () => {
   const v = $('clientIdInput').value.trim();
   if (!/\.apps\.googleusercontent\.com$/.test(v)){ alert('Client ID-টা ঠিক মনে হচ্ছে না। শেষে .apps.googleusercontent.com থাকে।'); return; }
@@ -821,7 +868,8 @@ $('btnSettingsSave').onclick = () => {
 };
 $('btnSignOut').onclick = () => {
   if (state.token && window.google?.accounts?.oauth2) google.accounts.oauth2.revoke(state.token, () => {});
-  state.token = null; state.email = ''; store.set('signedIn', false);
+  state.token = null; state.tokenExp = 0; state.email = '';
+  store.set('tok', null); store.set('email', '');
   $('settingsModal').classList.remove('open'); renderAuth();
 };
 $('settingsModal').addEventListener('click', e => { if (e.target.id === 'settingsModal') $('settingsModal').classList.remove('open'); });
@@ -838,12 +886,33 @@ const qp = new URLSearchParams(location.search);
 const shared = qp.get('link') || qp.get('text') || qp.get('url');
 if (shared){ const m = shared.match(/https?:\/\/\S+/); $('srcLink').value = m ? m[0] : shared; history.replaceState(null, '', location.pathname); }
 
-updateNet(); renderDest(); renderAuth();
+updateNet(); renderDest();
 if (!clientId()) $('setupCard').classList.remove('hidden');
-window.addEventListener('load', () => {
-  initTokenClient();
-  if ($('srcLink').value) inspectSource();
-});
+
+(async function boot(){
+  const ret = handleRedirectReturn();
+  if (ret?.redirecting) return;
+  if (!ret){                                   // normal open: reuse a still-valid token
+    const saved = store.get('tok', null);
+    if (saved && saved.e > Date.now()){ state.token = saved.t; state.tokenExp = saved.e; }
+  }
+  if (!shared && !$('srcLink').value) $('srcLink').value = store.get('pendingLink', '') || '';
+  store.set('pendingLink', '');
+  if (ret?.error) alert('সাইন ইন হয়নি: ' + (ret.error === 'access_denied' ? 'অনুমতি দেওয়া হয়নি' : ret.error));
+  if (state.token){
+    try { await loadProfile(); }
+    catch (e){ state.token = null; store.set('tok', null); }
+  }
+  // Show the last account even when the hour-long session has ended; the next action renews it.
+  if (ret?.error) store.set('email', '');          // avoid an automatic sign-in loop after a failure
+  else if (!state.email && store.get('email', '')) state.email = store.get('email', '');
+  renderAuth();
+  if ($('srcLink').value){
+    await inspectSource();
+    if (ret?.resume && state.src && state.dest) proceed();   // continue the Proceed that needed a fresh session
+  }
+})();
+window.addEventListener('load', () => { initTokenClient(); });
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
 </script>
 </body>
