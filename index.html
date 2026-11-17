@@ -155,6 +155,8 @@
       <div>ফোনের নেট দিয়ে ডাউনলোড + আপলোড একসাথে<small>ওয়াইফাই বা মোবাইল ডাটা, যেটা চালু আছে সেটা দিয়ে। ফাইল ফোনে জমা হয় না।</small></div></label>
     <label class="opt"><input type="radio" name="mode" value="copy">
       <div>সরাসরি ড্রাইভ থেকে ড্রাইভে কপি<small>ফোনের ডাটা খরচ হয় না, অনেক দ্রুত। Google-এর সার্ভারেই কপি হয়।</small></div></label>
+    <label class="opt"><input type="checkbox" id="optFlat">
+      <div>ফোল্ডারের লিঙ্ক দিলে: ভেতরের সব কিছু সরাসরি বাছা ফোল্ডারে রাখুন<small>চালু থাকলে বাছা ফোল্ডারটাই ক্লায়েন্টের ফোল্ডার হবে, আর তার লিঙ্কই পাবেন। বন্ধ থাকলে বাছা ফোল্ডারের ভেতরে এডিটরের ফোল্ডারের নামে নতুন ফোল্ডার বানাবে।</small></div></label>
     <label class="opt"><input type="checkbox" id="optShare">
       <div>শেষ হলে লিঙ্কটা শেয়ার-যোগ্য করুন<small>"Anyone with the link – Viewer"। ক্লায়েন্টকে পাঠানোর জন্য।</small></div></label>
   </section>
@@ -198,7 +200,7 @@
 <div class="sheet" id="sheet">
   <div class="grab"></div>
   <div class="row">
-    <input type="search" id="folderSearch" placeholder="🔍 ফোল্ডার খুঁজুন">
+    <input type="search" id="folderSearch" placeholder="🔍 ফোল্ডার খুঁজুন বা ফোল্ডারের লিঙ্ক পেস্ট করুন">
   </div>
   <div class="crumbs" id="crumbs"></div>
   <div class="flist" id="flist"></div>
@@ -764,7 +766,12 @@ async function proceed(){
 
   try {
     let rootParent = dest.id;
-    if (src.isFolder){
+    const flat = $('optFlat').checked && dest.id !== 'root';   // never share the whole My Drive
+    if (src.isFolder && flat){
+      resultLinkId = dest.id;
+      resultLink = `https://drive.google.com/drive/folders/${dest.id}`;
+      log(`📁 সরাসরি "${dest.name}" ফোল্ডারে রাখা হচ্ছে`);
+    } else if (src.isFolder){
       const top = await makeFolder(src.meta.name, dest.id);
       rootParent = top.id; resultLinkId = top.id;
       resultLink = top.webViewLink || `https://drive.google.com/drive/folders/${top.id}`;
@@ -841,7 +848,22 @@ $('btnPaste').onclick = async () => {
 let t; $('srcLink').addEventListener('input', () => { clearTimeout(t); t = setTimeout(inspectSource, 500); });
 $('btnPickFolder').onclick = openPicker;
 $('sheetBg').onclick = closePicker;
-let st; $('folderSearch').addEventListener('input', e => { clearTimeout(st); st = setTimeout(() => loadFolder(e.target.value.trim() || undefined), 400); });
+let st; $('folderSearch').addEventListener('input', e => {
+  clearTimeout(st);
+  st = setTimeout(async () => {
+    const v = e.target.value.trim();
+    const link = /drive\.google\.com/.test(v) && parseDriveLink(v);
+    if (!link) return loadFolder(v || undefined);
+    // A folder link was pasted: use that folder directly
+    $('flist').innerHTML = '<div class="fitem muted">লিঙ্ক দেখা হচ্ছে…</div>';
+    try {
+      const f = await apiJSON(`${API}/files/${link.id}?fields=id,name,mimeType,capabilities(canAddChildren)&supportsAllDrives=true`);
+      if (f.mimeType !== FOLDER_MIME) throw new Error('এটা ফোল্ডারের লিঙ্ক না।');
+      if (f.capabilities && f.capabilities.canAddChildren === false) throw new Error('এই ফোল্ডারে ফাইল রাখার অনুমতি আপনার নেই।');
+      chooseDest({id: f.id, name: f.name});
+    } catch (err){ $('flist').innerHTML = `<div class="fitem err">${esc(err.message)}</div>`; }
+  }, 400);
+});
 $('btnChooseHere').onclick = () => {
   const cur = state.pickerPath[state.pickerPath.length - 1];
   chooseDest({id: cur.id, name: state.pickerPath.map(p => p.name).join(' / ')});
@@ -877,6 +899,8 @@ document.querySelectorAll('input[name=mode]').forEach(r => r.onchange = () => st
 const savedMode = store.get('mode', 'stream');
 document.querySelector(`input[name=mode][value=${savedMode}]`).checked = true;
 $('optShare').checked = store.get('share', false);
+$('optFlat').checked = store.get('flat', true);
+$('optFlat').onchange = () => store.set('flat', $('optFlat').checked);
 $('optShare').onchange = () => store.set('share', $('optShare').checked);
 
 window.addEventListener('beforeunload', e => { if (state.running){ e.preventDefault(); e.returnValue = ''; } });
