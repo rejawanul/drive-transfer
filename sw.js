@@ -1,5 +1,5 @@
 // Caches only the app shell so it opens like an app. Drive traffic is never cached.
-const CACHE = 'drive-transfer-v2';
+const CACHE = 'drive-transfer-v3';
 const SHELL = ['./', 'index.html', 'manifest.json', 'icon-192.png', 'icon-512.png'];
 self.addEventListener('install', e => { e.waitUntil(caches.open(CACHE).then(c => c.addAll(SHELL))); self.skipWaiting(); });
 self.addEventListener('activate', e => {
